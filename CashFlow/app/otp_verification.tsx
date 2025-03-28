@@ -87,7 +87,7 @@ export default function PhoneVerification() {
       });
   
       await AsyncStorage.setItem('authToken', response.data.token);
-      router.replace({ pathname: "/dashboard", params: { user: JSON.stringify(response.data.user) }});
+      router.replace({ pathname: "/user_info", params: { user: JSON.stringify(response.data.user) }});
     } catch (error: any) {
       const message = error.response?.data?.message || "Invalid OTP. Please try again.";
       Alert.alert("Error", message);

@@ -1,6 +1,10 @@
 {
+
+ 
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
+    "jsx": "react-native",
+    "types": ["expo", "expo-camera"],
     "strict": true,
     "paths": {
       "@/*": [

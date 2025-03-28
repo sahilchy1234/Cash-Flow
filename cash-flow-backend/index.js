@@ -10,10 +10,10 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Twilio Setup (for OTP verification)
+// Twilio Setup
 const twilioClient = new Twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Database Connection
+// Database Setup
 const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASS, {
     host: process.env.DB_HOST,
     dialect: 'postgres',
@@ -24,57 +24,207 @@ const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USER, proces
     try {
         await sequelize.authenticate();
         console.log('✅ Database connected successfully');
+        await sequelize.sync({ alter: true });
+        console.log('✅ Database synced successfully');
     } catch (error) {
-        console.error('❌ Database connection failed:', error.message);
+        console.error('❌ Database error:', error.message);
         process.exit(1);
     }
 })();
 
-// Define User Model
+
+
+
+(async () => {
+    await sequelize.sync({ alter: true });
+})();
+
+
+// User Model
 const User = sequelize.define('User', {
     id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     phone: { type: DataTypes.STRING, allowNull: false, unique: true },
-    password_hash: { type: DataTypes.STRING, allowNull: true }, // Optional if using OTP-only login
-    otp_code: { type: DataTypes.STRING, allowNull: true }, // Temporary OTP Storage
-    otp_expires_at: { type: DataTypes.DATE, allowNull: true }, // OTP Expiry Time
+    name: { type: DataTypes.STRING, allowNull: true },
+    birthdate: { type: DataTypes.DATEONLY, allowNull: true },
+    otp_code: { type: DataTypes.STRING, allowNull: true },
+    otp_expires_at: { type: DataTypes.DATE, allowNull: true },
     wallet_balance: { type: DataTypes.DECIMAL, defaultValue: 0.0 },
 });
 
-// Sync Database
-(async () => {
-    try {
-        
-        await sequelize.sync({ alter: true }); // Updates tables to match models        console.log('✅ Database synced successfully');
-    } catch (error) {
-        console.error('❌ Database sync error:', error.message);
-    }
-})();
+// Authentication Middleware
+const authenticate = async (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: '❌ Unauthorized' });
 
-/**
- * 📌 Step 1: Send OTP (Registration & Login)
- */
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (error) {
+        return res.status(401).json({ message: '❌ Invalid token' });
+    }
+};
+
+
+const Transaction = sequelize.define('Transaction', {
+    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+    userId: { type: DataTypes.INTEGER, allowNull: false },
+    type: { 
+        type: DataTypes.ENUM('deposit', 'withdrawal', 'transfer'), 
+        allowNull: false 
+    },
+    amount: { 
+        type: DataTypes.DECIMAL, 
+        allowNull: false,
+        validate: { min: 0.01 } // Ensure amount is positive
+    },
+    status: { 
+        type: DataTypes.ENUM('pending', 'completed', 'failed'), 
+        defaultValue: 'pending' 
+    },
+}, { timestamps: true });
+
+
+
+User.hasMany(Transaction, { foreignKey: 'userId' });
+Transaction.belongsTo(User, { foreignKey: 'userId' });
+
+
+app.get('/transactions', authenticate, async (req, res) => {
+    try {
+        const transactions = await Transaction.findAll({ where: { userId: req.user.id }, order: [['createdAt', 'DESC']] });
+        res.json({ transactions });
+    } catch (error) {
+        console.error('Fetch Transactions Error:', error);
+        res.status(500).json({ message: '❌ Failed to fetch transactions', error: error.message });
+    }
+});
+
+// Add this to the existing server code
+
+// Transfer Route
+app.post('/transfer', authenticate, async (req, res) => {
+    const transaction = await sequelize.transaction();
+    try {
+        const { recipientPhone, amount } = req.body;
+        
+        // Validate input
+        if (!recipientPhone || !amount || amount <= 0) {
+            return res.status(400).json({ message: '❌ Invalid transfer details' });
+        }
+
+        // Find sender (current user)
+        const sender = await User.findByPk(req.user.id, { transaction });
+        if (!sender) {
+            return res.status(404).json({ message: '❌ Sender not found' });
+        }
+
+        // Find recipient
+        const recipient = await User.findOne({ 
+            where: { phone: recipientPhone },
+            transaction 
+        });
+        if (!recipient) {
+            return res.status(404).json({ message: '❌ Recipient not found' });
+        }
+
+        // Check sender's balance
+        const senderBalance = parseFloat(sender.wallet_balance);
+        const transferAmount = parseFloat(amount);
+        
+        if (senderBalance < transferAmount) {
+            return res.status(400).json({ message: '❌ Insufficient balance' });
+        }
+
+        // Perform transfer
+        sender.wallet_balance = senderBalance - transferAmount;
+        recipient.wallet_balance = parseFloat(recipient.wallet_balance) + transferAmount;
+
+        // Save changes
+        await sender.save({ transaction });
+        await recipient.save({ transaction });
+
+        // Create transaction records
+        await Transaction.create({
+            userId: sender.id,
+            type: 'transfer',
+            amount: transferAmount,
+            status: 'completed'
+        }, { transaction });
+
+        await Transaction.create({
+            userId: recipient.id,
+            type: 'transfer',
+            amount: transferAmount,
+            status: 'completed'
+        }, { transaction });
+
+        // Commit transaction
+        await transaction.commit();
+
+        res.json({ 
+            message: '✅ Transfer successful', 
+            newBalance: sender.wallet_balance 
+        });
+    } catch (error) {
+        // Rollback transaction in case of error
+        if (transaction) await transaction.rollback();
+        
+        console.error('Transfer Error:', error);
+        res.status(500).json({ 
+            message: '❌ Transfer failed', 
+            error: error.message 
+        });
+    }
+});
+
+// New route to find user by phone number (for send payment screen)
+app.get('/find-user', authenticate, async (req, res) => {
+    try {
+        const { phone } = req.query;
+        
+        if (!phone) {
+            return res.status(400).json({ message: '❌ Phone number is required' });
+        }
+
+        const user = await User.findOne({ 
+            where: { phone },
+            attributes: ['id', 'name', 'phone'] 
+        });
+
+        if (!user) {
+            return res.status(404).json({ message: '❌ User not found' });
+        }
+
+        res.json({ user: { name: user.name, phone: user.phone } });
+    } catch (error) {
+        console.error('Find User Error:', error);
+        res.status(500).json({ 
+            message: '❌ Failed to find user', 
+            error: error.message 
+        });
+    }
+});
+
+// OTP Routes
 app.post('/send-otp', async (req, res) => {
     try {
         const { phone } = req.body;
         if (!phone) return res.status(400).json({ message: '❌ Phone number is required' });
 
-        // Generate a 6-digit OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const otpExpiresAt = new Date(Date.now() + 5 * 60 * 1000); // OTP valid for 5 minutes
+        const otpExpiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
         let user = await User.findOne({ where: { phone } });
 
         if (!user) {
-            // Create a new user if they don't exist
             user = await User.create({ phone, otp_code: otp, otp_expires_at: otpExpiresAt });
         } else {
-            // Update OTP for existing user
             await user.update({ otp_code: otp, otp_expires_at: otpExpiresAt });
         }
 
-        // Send OTP via Twilio
         await twilioClient.messages.create({
-            body: `Your Cash Flow verification code is: ${otp}`,
+            body: `Your verification code is: ${otp}`,
             from: process.env.TWILIO_PHONE_NUMBER,
             to: phone,
         });
@@ -86,56 +236,46 @@ app.post('/send-otp', async (req, res) => {
     }
 });
 
-/**
- * 📌 Step 2: Verify OTP and Login/Register
- */
+app.post('/deposit', authenticate, async (req, res) => {
+    try {
+        const { amount } = req.body;
+        if (!amount || amount <= 0) return res.status(400).json({ message: '❌ Invalid deposit amount' });
+
+        const user = await User.findByPk(req.user.id);
+        if (!user) return res.status(404).json({ message: '❌ User not found' });
+
+        user.wallet_balance = parseFloat(user.wallet_balance) + parseFloat(amount);
+        await user.save();
+
+        await Transaction.create({ userId: user.id, type: 'deposit', amount, status: 'completed' });
+
+        res.json({ message: '✅ Deposit successful', wallet_balance: user.wallet_balance });
+    } catch (error) {
+        console.error('Deposit Error:', error);
+        res.status(500).json({ message: '❌ Deposit failed', error: error.message });
+    }
+});
+
+
 app.post('/verify-otp', async (req, res) => {
     try {
         const { phone, otp } = req.body;
         if (!phone || !otp) return res.status(400).json({ message: '❌ Phone number and OTP are required' });
 
         const user = await User.findOne({ where: { phone } });
-        
-        // Add debug logs
-        console.log('User found:', user ? true : false);
-        if (user) {
-            console.log('Stored OTP:', user.otp_code, 'Type:', typeof user.otp_code);
-            console.log('Received OTP:', otp, 'Type:', typeof otp);
-            console.log('OTP Expires At:', user.otp_expires_at);
-            console.log('Current Time:', new Date());
-        }
+        if (!user) return res.status(400).json({ message: '❌ User not found' });
 
-        if (!user) {
-            return res.status(400).json({ message: '❌ User not found' });
-        }
+        if (user.otp_code !== otp) return res.status(400).json({ message: '❌ Invalid OTP' });
+        if (Date.now() > new Date(user.otp_expires_at).getTime()) return res.status(400).json({ message: '❌ OTP expired' });
 
-        // Convert both OTPs to string for comparison
-        if (user.otp_code !== otp) {
-            return res.status(400).json({ message: '❌ Invalid OTP' });
-        }
+        await user.update({ otp_code: null, otp_expires_at: null });
 
-        // Check expiration using server time
-        if (Date.now() > new Date(user.otp_expires_at).getTime()) {
-            return res.status(400).json({ message: '❌ OTP expired' });
-        }
-
-        // Generate JWT token
         const token = jwt.sign({ id: user.id, phone: user.phone }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
-        // Clear OTP fields
-        await user.update({ 
-            otp_code: null, 
-            otp_expires_at: null 
-        });
-
         res.json({ 
-            message: '✅ Login successful', 
+            message: '✅ OTP verified successfully', 
             token, 
-            user: { 
-                id: user.id, 
-                phone: user.phone, 
-                wallet_balance: user.wallet_balance 
-            } 
+            user: { id: user.id, phone: user.phone, name: user.name, birthdate: user.birthdate, wallet_balance: user.wallet_balance } 
         });
     } catch (error) {
         console.error('Verify OTP Error:', error);
@@ -143,25 +283,25 @@ app.post('/verify-otp', async (req, res) => {
     }
 });
 
-/**
- * 📌 Step 3: Middleware to Protect Routes
- */
-const authenticate = async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ message: '❌ Unauthorized' });
-
+// User Routes
+app.post('/update-user', authenticate, async (req, res) => {
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (error) {
-        res.status(401).json({ message: '❌ Invalid token' });
-    }
-};
+        const { name, birthdate } = req.body;
+        if (!name || !birthdate) return res.status(400).json({ message: '❌ Name and birthdate are required' });
 
-/**
- * 📌 Step 4: Protected Route Example (Get Wallet Balance)
- */
+        const user = await User.findByPk(req.user.id);
+        if (!user) return res.status(404).json({ message: '❌ User not found' });
+
+        await user.update({ name, birthdate });
+
+        res.json({ message: '✅ User details updated successfully', user });
+    } catch (error) {
+        console.error('Update User Error:', error);
+        res.status(500).json({ message: '❌ Failed to update user details', error: error.message });
+    }
+});
+
+// Wallet Routes
 app.get('/wallet', authenticate, async (req, res) => {
     try {
         const user = await User.findByPk(req.user.id);
@@ -174,13 +314,11 @@ app.get('/wallet', authenticate, async (req, res) => {
     }
 });
 
-/**
- * 📌 Step 5: Logout (Optional - Clears JWT on Frontend)
- */
+// Logout Route
 app.post('/logout', authenticate, (req, res) => {
     res.json({ message: '✅ Logged out successfully' });
 });
 
 // Start Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Cash Flow Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
